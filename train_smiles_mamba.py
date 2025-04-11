@@ -420,7 +420,35 @@ class RMSNorm(nn.Module):
         return output
 
 
+class RelativePositionEncoding(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        self.rel_pos_emb = nn.Embedding(2 * max_len - 1, d_model)
+        self.max_len = max_len
 
+    def forward(self, x):
+        B, L, D = x.size()
+        pos = torch.arange(L, device=x.device)
+        rel_pos = pos[None, :] - pos[:, None] + self.max_len - 1  # 偏移确保正值索引
+        rel_pos_emb = self.rel_pos_emb(rel_pos)  # (L, L, D)
+        rel_pos_emb = rel_pos_emb.mean(dim=1)  # 简化为 (L, D)
+        return x + rel_pos_emb.unsqueeze(0)  # (B, L, D)
+
+def get_mamba_config(seq_len: int, d_model: int = 128, n_layers: int = 3):
+    if seq_len <= 32:  # 可自定义短序列阈值
+        expand_factor = 1
+        d_state = 4
+    else:
+        expand_factor = 2
+        d_state = 8
+
+    return MambaConfig(
+        d_model=d_model,
+        n_layers=n_layers,
+        expand_factor=expand_factor,
+        d_state=d_state,
+        use_cuda=torch.cuda.is_available()
+    )
 
 # 定义Mamba模型类
 class MambaModel(nn.Module):
@@ -428,14 +456,21 @@ class MambaModel(nn.Module):
         super(MambaModel, self).__init__()
         self.embedding = nn.Embedding(input_dim, hidden_dim)
         self.mamba = Mamba(mamba_config)
+        self.position_encoding = RelativePositionEncoding(256, hidden_dim)
+
         self.decoder = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, src):
+        B, L = src.shape
         src = self.embedding(src) * math.sqrt(self.embedding.embedding_dim)
+        src = self.position_encoding(src)
+        if self.mamba is None:
+            config = get_mamba_config(seq_len=L, d_model=self.hidden_dim)
+            self.mamba = Mamba(config).to(src.device)
+
         output = self.mamba(src)
         output = self.decoder(output)
         return output
-
 
 
 # 检查是否有可用的GPU
@@ -477,7 +512,7 @@ char_to_id = {ch: idx + 1 for idx, ch in enumerate(char_list)}
 char_to_id['<pad>'] = 0  # 添加填充符
 
 # 读取mols.txt文件中的SMILES字符串
-with open('.data/mols.txt', 'r') as file:
+with open('mols.txt', 'r') as file:
     smiles = file.readlines()
 smiles = [s.strip() for s in smiles]
 
