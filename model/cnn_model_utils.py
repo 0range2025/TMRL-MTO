@@ -35,25 +35,55 @@ def get_max_len(smiles):
     return max(len(re.findall(r'(\[[^\[\]]*\]|Br|Cl|[a-z]|\d|[A-Z]|[^a-zA-Z0-9])', s)) for s in smiles)
 
 
+class RelativePositionEncoding(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        self.rel_pos_emb = nn.Embedding(2 * max_len - 1, d_model)
+        self.max_len = max_len
+
+    def forward(self, x):
+        B, L, D = x.size()
+        pos = torch.arange(L, device=x.device)
+        rel_pos = pos[None, :] - pos[:, None] + self.max_len - 1  # 偏移确保正值索引
+        rel_pos_emb = self.rel_pos_emb(rel_pos)  # (L, L, D)
+        rel_pos_emb = rel_pos_emb.mean(dim=1)  # 简化为 (L, D)
+        return x + rel_pos_emb.unsqueeze(0)  # (B, L, D)
+
+def get_mamba_config(seq_len: int, d_model: int = 128, n_layers: int = 3):
+    if seq_len <= 32:  # 可自定义短序列阈值
+        expand_factor = 1
+        d_state = 4
+    else:
+        expand_factor = 2
+        d_state = 8
+
+    return MambaConfig(
+        d_model=d_model,
+        n_layers=n_layers,
+        expand_factor=expand_factor,
+        d_state=d_state,
+        use_cuda=torch.cuda.is_available()
+    )
 class MambaModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, mamba_config):
         super(MambaModel, self).__init__()
         self.embedding = nn.Embedding(input_dim, hidden_dim)
         self.mamba = Mamba(mamba_config)
+        self.position_encoding = RelativePositionEncoding(256, hidden_dim)
+
         self.decoder = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, src):
-        src = self.embedding(src) * math.sqrt(self.embedding.embedding_dim)  # (64,95,128)
+        B, L = src.shape
+        src = self.embedding(src) * math.sqrt(self.embedding.embedding_dim)
+        src = self.position_encoding(src)
+        if self.mamba is None:
+            config = get_mamba_config(seq_len=L, d_model=self.hidden_dim)
+            self.mamba = Mamba(config).to(src.device)
+
         output = self.mamba(src)
         output = self.decoder(output)
         return output
-
-    def encode(self, src):
-        src = self.embedding(src) * math.sqrt(self.embedding.embedding_dim)
-        output = self.mamba(src)
-        output = output.mean(dim=1)  # (batch_size, hidden_dim)
-        return output
-
 
 def load_model_and_decode(smiles_list):
     # 模型参数
